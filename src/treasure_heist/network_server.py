@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import logging
 import random
 import socket
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .communications.base import CommunicationBase
 from .models import GameState, PlayerState
 from .network_protocol import decode_message, encode_message
+
+_logger = logging.getLogger(__name__)
+
+_INBOX_MAX = 200
 
 
 @dataclass
@@ -17,12 +22,21 @@ class ClientConn:
     file_out: any
     lock: threading.Lock
     player_id: str
+    disconnected: bool = field(default=False, init=False)
 
-    def send(self, payload: dict) -> None:
+    def send(self, payload: dict) -> bool:
+        if self.disconnected:
+            return False
         data = encode_message(payload)
-        with self.lock:
-            self.file_out.write(data)
-            self.file_out.flush()
+        try:
+            with self.lock:
+                self.file_out.write(data)
+                self.file_out.flush()
+            return True
+        except OSError:
+            self.disconnected = True
+            _logger.warning("send failed for %s, marking disconnected", self.player_id)
+            return False
 
 
 class NetworkTreasureHeistServer:
@@ -51,6 +65,9 @@ class NetworkTreasureHeistServer:
         self._clients_lock = threading.Lock()
         self._running = False
         self._log_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._action_submitted: set[str] = set()
+        self._action_lock = threading.Lock()
 
     def _log(self, message: str) -> None:
         with self._log_lock:
@@ -130,7 +147,7 @@ class NetworkTreasureHeistServer:
         with self._clients_lock:
             conns = list(self._clients.values())
         for conn in conns:
-            conn.send(payload)
+            conn.send(payload)  # individual failures handled inside send()
         text = payload.get("text", "")
         if text:
             self._log(f"[server -> ALL] {text}")
@@ -145,8 +162,15 @@ class NetworkTreasureHeistServer:
                 msg_type = payload.get("type")
                 self._log(f"[{conn.player_id} -> server] {payload}")
                 if msg_type == "action":
+                    with self._action_lock:
+                        already = conn.player_id in self._action_submitted
+                    if already:
+                        conn.send({"type": "error", "text": "action already submitted this turn"})
+                        continue
                     action = str(payload.get("action", "")).strip() or "wait"
                     self.comm.submit_action(conn.player_id, action)
+                    with self._action_lock:
+                        self._action_submitted.add(conn.player_id)
                     conn.send({"type": "info", "text": f"[client] submitted action: {action}"})
                 elif msg_type == "chat":
                     text = str(payload.get("text", "")).strip()
@@ -155,7 +179,8 @@ class NetworkTreasureHeistServer:
                     else:
                         self._log(f"[chat] {conn.player_id}: {text}")
                         self._process_chat_line(conn.player_id, text)
-                        self._drain_messages()
+                        with self._drain_lock:
+                            self._drain_messages()
                         conn.send({"type": "info", "text": "[chat delivered — does not use your turn]"})
                 elif msg_type == "ping":
                     conn.send({"type": "pong"})
@@ -163,7 +188,6 @@ class NetworkTreasureHeistServer:
                     conn.send({"type": "error", "text": "unknown message type"})
         finally:
             with self._clients_lock:
-                # Disconnecting mid-game is treated as this player waiting every turn.
                 if conn.player_id in self._clients:
                     del self._clients[conn.player_id]
             self._log(f"[server] {conn.player_id} disconnected")
@@ -288,7 +312,7 @@ class NetworkTreasureHeistServer:
             around = []
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]:
                 rr, cc = player.row + dr, player.col + dc
-                if (rr, cc) in self.artifacts:
+                if 0 <= rr < self.state.height and 0 <= cc < self.state.width and (rr, cc) in self.artifacts:
                     around.append((rr, cc))
             msg = f"[private] scout sees artifacts at: {around}" if around else "[private] scout found nothing"
             self.comm.send_to_player(pid, msg)
@@ -312,7 +336,10 @@ class NetworkTreasureHeistServer:
                 msg = self.comm.receive(pid, timeout=0.01)
                 if msg is None:
                     break
-                self.players[pid].inbox_preview.append(msg)
+                inbox = self.players[pid].inbox_preview
+                if len(inbox) >= _INBOX_MAX:
+                    inbox.pop(0)
+                inbox.append(msg)
                 self._log(f"[comm -> {pid}] {msg}")
                 self._send_to_player(pid, {"type": "info", "text": msg})
 
@@ -385,6 +412,8 @@ class NetworkTreasureHeistServer:
                     break
 
                 self._log(f"[turn {self.state.turn}] starting")
+                with self._action_lock:
+                    self._action_submitted.clear()
                 self.comm.broadcast(f"[broadcast] starting turn {self.state.turn}")
                 self._send_prompt_to_all()
                 actions = self.comm.next_turn()
@@ -398,7 +427,8 @@ class NetworkTreasureHeistServer:
                     self.comm.broadcast("[broadcast] random security sweep increased alarm")
 
                 self._check_extractions()
-                self._drain_messages()
+                with self._drain_lock:
+                    self._drain_messages()
                 server_summary = self._turn_summary_text(artifact_mode="all")
                 client_summary = self._turn_summary_text(artifact_mode="discovered")
                 self._log(server_summary)
