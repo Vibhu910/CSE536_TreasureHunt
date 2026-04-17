@@ -11,7 +11,7 @@ from .base import CommunicationBase
 
 _logger = logging.getLogger(__name__)
 
-_TURN_TIMEOUT = 60.0
+_TURN_TIMEOUT = 100.0
 _RECEIVE_POLL = 0.5
 
 _SENTINEL = "__RPC_NONE__"

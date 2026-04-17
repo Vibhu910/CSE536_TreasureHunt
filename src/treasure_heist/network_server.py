@@ -155,9 +155,14 @@ class NetworkTreasureHeistServer:
     def _handle_client(self, conn: ClientConn) -> None:
         try:
             while self._running:
-                line = conn.file_in.readline()
+                try:
+                    line = conn.file_in.readline()
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    break
+                    
                 if not line:
                     break
+                
                 payload = decode_message(line.decode("utf-8").strip())
                 msg_type = payload.get("type")
                 self._log(f"[{conn.player_id} -> server] {payload}")
