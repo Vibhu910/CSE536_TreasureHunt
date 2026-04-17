@@ -333,7 +333,7 @@ class NetworkTreasureHeistServer:
     def _drain_messages(self) -> None:
         for pid in self.players:
             while True:
-                msg = self.comm.receive(pid, timeout=0.01)
+                msg = self.comm.receive(pid, timeout=0.1)
                 if msg is None:
                     break
                 inbox = self.players[pid].inbox_preview

@@ -5,20 +5,28 @@ import queue
 import threading
 from xmlrpc.client import ServerProxy
 from xmlrpc.server import SimpleXMLRPCServer
+from socketserver import ThreadingMixIn
 
 from .base import CommunicationBase
 
 _logger = logging.getLogger(__name__)
 
-_TURN_TIMEOUT = 120.0
+_TURN_TIMEOUT = 60.0
 _RECEIVE_POLL = 0.5
 
 _SENTINEL = "__RPC_NONE__"
 
 
+class ThreadingXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 class _RpcBackend:
     def __init__(self, player_ids: list[str]):
-        self._mailboxes: dict[str, queue.Queue[str]] = {pid: queue.Queue() for pid in player_ids}
+        self._mailboxes: dict[str, queue.Queue[str]] = {
+            pid: queue.Queue() for pid in player_ids
+        }
         self._actions: queue.Queue[tuple[str, str]] = queue.Queue()
         self._player_ids = player_ids
 
@@ -75,26 +83,51 @@ class _RpcBackend:
         return actions
 
 
+# class
 class RpcComm(CommunicationBase):
     """RPC communication library using stdlib XML-RPC."""
 
     def __init__(self, player_ids: list[str], host: str = "127.0.0.1", port: int = 0):
         super().__init__(player_ids)
         self._closed = False
+        self._proxy_lock = threading.Lock()
         self._backend = _RpcBackend(player_ids)
-        self._server = SimpleXMLRPCServer((host, port), allow_none=True, logRequests=False)
+        self._server = ThreadingXMLRPCServer(
+            (host, port), allow_none=True, logRequests=False
+        )
         self._server.register_instance(self._backend)
-        self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._server_thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True
+        )
         self._server_thread.start()
         bound_host, bound_port = self._server.server_address
-        self._proxy = ServerProxy(f"http://{bound_host}:{bound_port}", allow_none=True)
+        self._url = f"http://{bound_host}:{bound_port}"
+
+        # self._proxy = ServerProxy(f"http://{bound_host}:{bound_port}", allow_none=True)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        try:
+            self._closed = True
+        except Exception:
+            pass
+
+        self._server.shutdown()
+        self._server.server_close()
+        self._server_thread.join(timeout=3.0)
 
     def _rpc_call(self, method: str, *args):
         if self._closed:
-            _logger.warning("RPC call %s after close(), ignoring", method)
-            return None
+            # _logger.warning("RPC call %s after close(), ignoring", method)
+            # return None
+            raise RuntimeError(f"RPC call {method} after close()")
+
         try:
-            return getattr(self._proxy, method)(*args)
+            with ServerProxy(self._url, allow_none=True) as proxy:
+                return getattr(proxy, method)(*args)
         except Exception:
             _logger.warning("RPC call %s failed", method, exc_info=True)
             return None
@@ -122,11 +155,3 @@ class RpcComm(CommunicationBase):
         if result is None:
             return {pid: "wait" for pid in self.player_ids}
         return result
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._server.shutdown()
-        self._server.server_close()
-        self._server_thread.join(timeout=3.0)

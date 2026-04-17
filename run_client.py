@@ -38,10 +38,10 @@ def receiver_loop(file_in, stop_event: threading.Event, prompt_event: threading.
         text = payload.get("text", "")
 
         if msg_type == "prompt":
-            print(f"\n{text}")
+            print(f"\n{text}", flush=True)
             prompt_event.set()
         elif msg_type in {"info", "summary", "welcome", "error", "game_over"}:
-            print(f"\n{text}")
+            print(f"\n{text}", flush=True)
             if msg_type == "game_over":
                 stop_event.set()
                 prompt_event.set()
